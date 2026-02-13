@@ -1,0 +1,35 @@
+# Core
+numpy
+pandas
+scipy
+
+# Finance
+yfinance
+arch
+
+# ML
+scikit-learn
+torch
+
+# HMM
+hmmlearn
+
+# Wavelets
+PyWavelets
+
+# Visualization
+matplotlib
+plotly
+
+# Dashboard
+streamlit
+
+# Experiment tracking
+mlflow
+
+# Testing
+pytest
+pytest-cov
+
+# Utilities
+python-dotenv
