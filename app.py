@@ -1,39 +1,50 @@
-import streamlit as st
+import os
+import random
 import numpy as np
 import torch
+import streamlit as st
 import plotly.graph_objects as go
 import yfinance as yf
 
-from src.pipeline.train_pipeline import TrainingPipeline
 from src.models.lstm_model import LSTMVolatility
 from src.models.model_io import load_model
-from src.models.uncertainty import mc_dropout_predict
-from src.models.hmm_model import RegimeHMM
+from src.pipeline.train_pipeline import TrainingPipeline
 from src.risk_engine.risk_score import RiskScorer
+from src.models.garch_model import GARCHModel
+from src.data_loader.data_ingestion import MarketDataLoader
+
+
+# ==========================
+# Deterministic Behavior
+# ==========================
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
 
 
 st.set_page_config(page_title="FinRisk-Engine", layout="wide")
 
-st.title("📊 FinRisk-Engine — Institutional Market Intelligence")
+st.title("📊 FinRisk-Engine — Institutional Volatility Intelligence")
 
-# Sidebar
+
+# ==========================
+# Sidebar Config
+# ==========================
 st.sidebar.header("Configuration")
+
 ticker = st.sidebar.text_input("Ticker", "AAPL")
 start_date = st.sidebar.text_input("Start Date", "2020-01-01")
-run_button = st.sidebar.button("Run Analysis")
+train_model = st.sidebar.button("Train Model")
+run_forecast = st.sidebar.button("Run Forecast")
 
-if run_button:
 
-    # ===============================
-    # 1️⃣ Fetch Current Price
-    # ===============================
-    data = yf.download(ticker, period="5d", progress=False)
-    current_price = float(data["Close"].iloc[-1])
-    previous_close = float(data["Close"].iloc[-2])
+# ==========================
+# TRAIN MODEL (Offline)
+# ==========================
+if train_model:
 
-    # ===============================
-    # 2️⃣ Run Training Pipeline
-    # ===============================
+    st.info("Training volatility models...")
+
     pipeline = TrainingPipeline(
         tickers=[ticker],
         start_date=start_date
@@ -41,68 +52,70 @@ if run_button:
 
     results = pipeline.run()
 
-    # ===============================
-    # 3️⃣ Load LSTM Model
-    # ===============================
-    model = LSTMVolatility()
-    model = load_model(model, "models_artifacts/lstm_model.pth")
+    st.success("Model training completed.")
+    st.write(results)
 
-    x = torch.randn(1, 20, 1)
 
-    mean_pred, std_pred = mc_dropout_predict(model, x)
+# ==========================
+# RUN FORECAST
+# ==========================
+if run_forecast:
 
-    predicted_return = float(mean_pred.item())
-    uncertainty = float(std_pred.item())
+    # Load historical data
+    loader = MarketDataLoader([ticker], start_date)
+    returns = loader.run().squeeze()
 
-    # ===============================
-    # 4️⃣ Direction & % Move
-    # ===============================
-    predicted_price = current_price * (1 + predicted_return)
-    percent_move = predicted_return * 100
+    # Current price
+    price_data = yf.download(ticker, period="5d", progress=False)
+    current_price = float(price_data["Close"].iloc[-1])
 
-    if predicted_return > 0:
+    # Volatility series
+    window = 20
+    vol_series = returns.rolling(window).std().dropna()
+
+    # Load trained LSTM model
+    model = LSTMVolatility(input_size=1)
+    model = load_model(model, "models_artifacts/lstm_vol_model.pth")
+    model.eval()
+
+    latest_window = vol_series.values[-window:]
+    x = torch.tensor(latest_window.reshape(1, window, 1), dtype=torch.float32)
+
+    with torch.no_grad():
+        predicted_vol = float(model(x).item())
+
+    # GARCH forecast
+    garch_model = GARCHModel()
+    garch_model.fit(returns)
+    garch_vol = float(garch_model.forecast(horizon=1).values[0])
+
+    # Risk score
+    drawdown = (returns.cumsum().min())
+    risk_score = RiskScorer.compute(predicted_vol, drawdown)
+
+    # Direction classification
+    recent_return = returns.iloc[-1]
+
+    if recent_return > 0:
         direction = "Bullish 📈"
         color = "green"
     else:
         direction = "Bearish 📉"
         color = "red"
 
-    # ===============================
-    # 5️⃣ Confidence Score
-    # ===============================
-    confidence = max(0, 100 - (uncertainty * 1000))
-    confidence = min(confidence, 100)
-
-    # ===============================
-    # 6️⃣ Regime Detection
-    # ===============================
-    returns = np.random.randn(300)
-    hmm = RegimeHMM(n_states=2)
-    hmm.fit(returns)
-    states, probs = hmm.predict(returns)
-    latest_regime_prob = probs[-1]
-
-    # ===============================
-    # 7️⃣ Risk Score
-    # ===============================
-    risk_score = RiskScorer.compute(
-        volatility=abs(predicted_return),
-        drawdown=-0.2
-    )
-
-    # ===============================
-    # DASHBOARD DISPLAY
-    # ===============================
-
+    # ==========================
+    # DISPLAY
+    # ==========================
     col1, col2, col3 = st.columns(3)
 
     col1.metric("Current Price", f"${current_price:.2f}")
-    col2.metric("Predicted Move", f"{percent_move:.2f}%")
-    col3.metric("Model Confidence", f"{confidence:.1f}%")
+    col2.metric("Predicted Volatility (LSTM)", f"{predicted_vol:.4f}")
+    col3.metric("GARCH Volatility", f"{garch_vol:.4f}")
 
-    st.markdown(f"## Market Direction: <span style='color:{color}'>{direction}</span>", unsafe_allow_html=True)
-
-    st.markdown("---")
+    st.markdown(
+        f"## Market Direction: <span style='color:{color}'>{direction}</span>",
+        unsafe_allow_html=True
+    )
 
     # Risk Gauge
     fig = go.Figure(go.Indicator(
@@ -111,7 +124,6 @@ if run_button:
         title={"text": "Composite Risk Score"},
         gauge={
             "axis": {"range": [0, 100]},
-            "bar": {"color": "red"},
             "steps": [
                 {"range": [0, 30], "color": "green"},
                 {"range": [30, 70], "color": "yellow"},
@@ -121,33 +133,3 @@ if run_button:
     ))
 
     st.plotly_chart(fig, use_container_width=True)
-
-    # Regime Probabilities
-    st.subheader("Regime Probabilities")
-
-    fig_regime = go.Figure()
-    for i in range(len(latest_regime_prob)):
-        fig_regime.add_trace(
-            go.Bar(
-                x=[f"Regime {i}"],
-                y=[latest_regime_prob[i]]
-            )
-        )
-
-    st.plotly_chart(fig_regime, use_container_width=True)
-
-    # Forecast Band
-    st.subheader("Forecast with Uncertainty Band")
-
-    x_axis = np.arange(10)
-    vol_forecast = np.full(10, predicted_price)
-
-    upper = vol_forecast * (1 + uncertainty)
-    lower = vol_forecast * (1 - uncertainty)
-
-    fig_band = go.Figure()
-    fig_band.add_trace(go.Scatter(x=x_axis, y=vol_forecast, name="Predicted Price"))
-    fig_band.add_trace(go.Scatter(x=x_axis, y=upper, name="Upper Band"))
-    fig_band.add_trace(go.Scatter(x=x_axis, y=lower, name="Lower Band"))
-
-    st.plotly_chart(fig_band, use_container_width=True)
