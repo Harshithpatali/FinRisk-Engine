@@ -1,10 +1,11 @@
-import os
 import random
 import numpy as np
 import torch
 import streamlit as st
 import plotly.graph_objects as go
 import yfinance as yf
+import pandas as pd
+from datetime import date
 
 from src.models.lstm_model import LSTMVolatility
 from src.models.model_io import load_model
@@ -12,6 +13,7 @@ from src.pipeline.train_pipeline import TrainingPipeline
 from src.risk_engine.risk_score import RiskScorer
 from src.models.garch_model import GARCHModel
 from src.data_loader.data_ingestion import MarketDataLoader
+from src.models.hmm_model import RegimeHMM
 
 
 # ==========================
@@ -21,115 +23,213 @@ torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
 
-
 st.set_page_config(page_title="FinRisk-Engine", layout="wide")
 
-st.title("📊 FinRisk-Engine — Institutional Volatility Intelligence")
+st.title("📊 FinRisk-Engine — Institutional Risk Terminal")
 
 
 # ==========================
-# Sidebar Config
+# SIDEBAR
 # ==========================
-st.sidebar.header("Configuration")
+st.sidebar.header("Market Configuration")
 
-ticker = st.sidebar.text_input("Ticker", "AAPL")
-start_date = st.sidebar.text_input("Start Date", "2020-01-01")
-train_model = st.sidebar.button("Train Model")
-run_forecast = st.sidebar.button("Run Forecast")
+popular_stocks = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",
+    "META", "NVDA", "JPM", "SPY", "QQQ"
+]
 
+ticker_list = st.sidebar.multiselect(
+    "Select Portfolio Stocks",
+    options=popular_stocks,
+    default=["AAPL"]
+)
 
-# ==========================
-# TRAIN MODEL (Offline)
-# ==========================
-if train_model:
+start_date = st.sidebar.date_input(
+    "Start Date",
+    value=date(2020, 1, 1)
+)
 
-    st.info("Training volatility models...")
-
-    pipeline = TrainingPipeline(
-        tickers=[ticker],
-        start_date=start_date
-    )
-
-    results = pipeline.run()
-
-    st.success("Model training completed.")
-    st.write(results)
+run_analysis = st.sidebar.button("Run Risk Analysis")
 
 
 # ==========================
-# RUN FORECAST
+# ANALYSIS
 # ==========================
-if run_forecast:
+if run_analysis:
 
-    # Load historical data
-    loader = MarketDataLoader([ticker], start_date)
-    returns = loader.run().squeeze()
+    portfolio_data = {}
+    portfolio_returns = []
 
-    # Current price
-    price_data = yf.download(ticker, period="5d", progress=False)
-    current_price = float(price_data["Close"].iloc[-1])
+    for ticker in ticker_list:
 
-    # Volatility series
-    window = 20
-    vol_series = returns.rolling(window).std().dropna()
+        loader = MarketDataLoader([ticker], str(start_date))
+        returns = loader.run().squeeze()
+        portfolio_returns.append(returns)
 
-    # Load trained LSTM model
-    model = LSTMVolatility(input_size=1)
-    model = load_model(model, "models_artifacts/lstm_vol_model.pth")
-    model.eval()
+        price_data = yf.download(ticker, start=str(start_date), progress=False)
 
-    latest_window = vol_series.values[-window:]
-    x = torch.tensor(latest_window.reshape(1, window, 1), dtype=torch.float32)
+        # ----------------------------
+        # LIVE PRICE CHART
+        # ----------------------------
+        st.markdown(f"## 📈 {ticker} Price Chart")
 
-    with torch.no_grad():
-        predicted_vol = float(model(x).item())
+        fig_price = go.Figure()
+        fig_price.add_trace(
+            go.Scatter(
+                x=price_data.index,
+                y=price_data["Close"],
+                name="Close Price"
+            )
+        )
+        st.plotly_chart(fig_price, use_container_width=True)
 
-    # GARCH forecast
-    garch_model = GARCHModel()
-    garch_model.fit(returns)
-    garch_vol = float(garch_model.forecast(horizon=1).values[0])
+        # ----------------------------
+        # VOLATILITY HISTORY
+        # ----------------------------
+        window = 20
+        vol_series = returns.rolling(window).std().dropna()
 
-    # Risk score
-    drawdown = (returns.cumsum().min())
-    risk_score = RiskScorer.compute(predicted_vol, drawdown)
+        st.markdown("### 📊 Rolling Volatility")
 
-    # Direction classification
-    recent_return = returns.iloc[-1]
+        fig_vol = go.Figure()
+        fig_vol.add_trace(
+            go.Scatter(
+                x=vol_series.index,
+                y=vol_series.values,
+                name="Rolling Volatility"
+            )
+        )
+        st.plotly_chart(fig_vol, use_container_width=True)
 
-    if recent_return > 0:
-        direction = "Bullish 📈"
-        color = "green"
-    else:
-        direction = "Bearish 📉"
-        color = "red"
+        # ----------------------------
+        # DRAWdown
+        # ----------------------------
+        cumulative = (1 + returns).cumprod()
+        peak = cumulative.cummax()
+        drawdown = (cumulative - peak) / peak
+
+        st.markdown("### 📉 Rolling Drawdown")
+
+        fig_dd = go.Figure()
+        fig_dd.add_trace(
+            go.Scatter(
+                x=drawdown.index,
+                y=drawdown.values,
+                name="Drawdown"
+            )
+        )
+        st.plotly_chart(fig_dd, use_container_width=True)
+
+        # ----------------------------
+        # VaR & CVaR
+        # ----------------------------
+        confidence_level = 0.95
+        var = np.percentile(returns, 100 * (1 - confidence_level))
+        cvar = returns[returns <= var].mean()
+
+        st.markdown("### 🛑 Risk Metrics")
+
+        col1, col2 = st.columns(2)
+        col1.metric("VaR (95%)", f"{var:.4f}")
+        col2.metric("CVaR (95%)", f"{cvar:.4f}")
+
+        # ----------------------------
+        # REGIME DETECTION
+        # ----------------------------
+        st.markdown("### 🔍 Market Regime")
+
+        hmm = RegimeHMM(n_states=2)
+        hmm.fit(returns.values)
+        states, _ = hmm.predict(returns.values)
+
+        fig_regime = go.Figure()
+        fig_regime.add_trace(
+            go.Scatter(
+                x=returns.index,
+                y=states,
+                mode="markers",
+                name="Regime State"
+            )
+        )
+        st.plotly_chart(fig_regime, use_container_width=True)
+
+        # Store for portfolio aggregation
+        portfolio_data[ticker] = {
+            "returns": returns,
+            "volatility": vol_series,
+            "drawdown": drawdown,
+            "VaR": var,
+            "CVaR": cvar
+        }
 
     # ==========================
-    # DISPLAY
+    # PORTFOLIO VIEW
     # ==========================
-    col1, col2, col3 = st.columns(3)
+    if len(ticker_list) > 1:
 
-    col1.metric("Current Price", f"${current_price:.2f}")
-    col2.metric("Predicted Volatility (LSTM)", f"{predicted_vol:.4f}")
-    col3.metric("GARCH Volatility", f"{garch_vol:.4f}")
+        st.markdown("## 🏦 Portfolio Risk Overview")
 
-    st.markdown(
-        f"## Market Direction: <span style='color:{color}'>{direction}</span>",
-        unsafe_allow_html=True
-    )
+        combined_returns = pd.concat(portfolio_returns, axis=1).mean(axis=1)
 
-    # Risk Gauge
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=risk_score,
-        title={"text": "Composite Risk Score"},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "steps": [
-                {"range": [0, 30], "color": "green"},
-                {"range": [30, 70], "color": "yellow"},
-                {"range": [70, 100], "color": "red"},
-            ],
-        },
-    ))
+        portfolio_vol = combined_returns.rolling(20).std().iloc[-1]
+        portfolio_var = np.percentile(combined_returns, 5)
+        portfolio_cvar = combined_returns[combined_returns <= portfolio_var].mean()
 
-    st.plotly_chart(fig, use_container_width=True)
+        risk_score = RiskScorer.compute(
+            portfolio_vol,
+            combined_returns.cumsum().min()
+        )
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Portfolio Volatility", f"{portfolio_vol:.4f}")
+        col2.metric("Portfolio VaR (95%)", f"{portfolio_var:.4f}")
+        col3.metric("Portfolio CVaR (95%)", f"{portfolio_cvar:.4f}")
+
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=risk_score,
+            title={"text": "Portfolio Risk Score"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "steps": [
+                    {"range": [0, 30], "color": "green"},
+                    {"range": [30, 70], "color": "yellow"},
+                    {"range": [70, 100], "color": "red"},
+                ],
+            },
+        ))
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ==========================
+    # EXPLANATION PANEL
+    # ==========================
+    with st.expander("ℹ️ Explanation of Metrics"):
+
+        st.markdown("""
+### Live Price Chart
+Displays historical closing prices.
+
+### Rolling Volatility
+20-day rolling standard deviation of returns.
+Measures short-term market uncertainty.
+
+### Rolling Drawdown
+Peak-to-trough decline from cumulative returns.
+
+### VaR (Value at Risk)
+Maximum expected loss at 95% confidence.
+
+### CVaR (Conditional VaR)
+Average loss beyond VaR threshold.
+Measures tail risk severity.
+
+### Regime Detection
+Hidden Markov Model classification of market states
+(e.g., low-volatility vs high-volatility regime).
+
+### Portfolio Risk Score
+Composite measure of:
+- Portfolio volatility
+- Historical drawdown
+        """)
